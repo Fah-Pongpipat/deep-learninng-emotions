@@ -1,103 +1,189 @@
+import os
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torchvision import datasets, transforms
-from torch.utils.data import DataLoader
-from sklearn.metrics import accuracy_score
 import torch.nn.functional as F
+from torch.utils.data import DataLoader, Dataset
+from torchvision import transforms
+from PIL import Image
 
-# Define the CNN model class
-class SimpleCNN(nn.Module):
-    def __init__(self, output_size):
-        super(SimpleCNN, self).__init__()
-        self.conv1 = nn.Conv2d(3, 32, kernel_size=3, stride=1, padding=1)
+# ================================
+# Dataset class
+# ================================
+class EmotionDataset(Dataset):
+    def __init__(self, folder_path, transform=None):
+        self.folder_path = folder_path
+        self.transform = transform
+        self.images = []
+        self.labels = []
+        self.label_map = {"angry": 0, "happy": 1, "sad": 2, "surprised": 3, "neutral": 4}
+
+        # Load images and labels
+        for label in self.label_map.keys():
+            label_folder = os.path.join(folder_path, label)
+            for filename in os.listdir(label_folder):
+                if filename.endswith(('.png', '.jpg', '.jpeg')):
+                    self.images.append(os.path.join(label_folder, filename))
+                    self.labels.append(self.label_map[label])
+
+    def __len__(self):
+        return len(self.images)
+
+    def __getitem__(self, idx):
+        image = Image.open(self.images[idx]).convert('L')  # Convert to grayscale
+        label = self.labels[idx]
+
+        if self.transform:
+            image = self.transform(image)
+
+        return image, label
+
+# ================================
+# Define the CNN model
+# ================================
+class EmotionClassifier(nn.Module):
+    def __init__(self):
+        super(EmotionClassifier, self).__init__()
+        self.conv1 = nn.Conv2d(1, 32, kernel_size=3, stride=1, padding=1)
+        self.bn1 = nn.BatchNorm2d(32)
         self.conv2 = nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1)
-        self.fc1 = nn.Linear(64 * 16 * 16, 128)  # Adjust based on image size and network design
-        self.fc2 = nn.Linear(128, output_size)
+        self.bn2 = nn.BatchNorm2d(64)
+        self.conv3 = nn.Conv2d(64, 128, kernel_size=3, stride=1, padding=1)
+        self.bn3 = nn.BatchNorm2d(128)
+        self.conv4 = nn.Conv2d(128, 256, kernel_size=3, stride=1, padding=1)
+        self.bn4 = nn.BatchNorm2d(256)
+
         self.pool = nn.MaxPool2d(kernel_size=2, stride=2, padding=0)
+        
+        # Set the input size for the first fully connected layer
+        self.fc1 = nn.Linear(256 * 3 * 3, 512)  # Adjusted for output after convolution
+        self.fc2 = nn.Linear(512, 5)  # 5 output classes for the emotions
         self.dropout = nn.Dropout(0.5)
 
     def forward(self, x):
-        x = self.pool(F.relu(self.conv1(x)))
-        x = self.pool(F.relu(self.conv2(x)))
-        x = x.view(x.size(0), -1)  # Flatten the tensor
-        x = F.relu(self.fc1(x))
-        x = self.dropout(x)
+        # Forward pass through convolutional layers
+        x = self.pool(F.relu(self.bn1(self.conv1(x))))
+        x = self.pool(F.relu(self.bn2(self.conv2(x))))
+        x = self.pool(F.relu(self.bn3(self.conv3(x))))
+        x = self.pool(F.relu(self.bn4(self.conv4(x))))
+        
+        # Flattening
+        x = x.view(x.size(0), -1)  # Flattening
+        
+        # Forward pass through fully connected layers
+        x = self.dropout(F.relu(self.fc1(x)))
         x = self.fc2(x)
-        return F.softmax(x, dim=1)
+        return F.log_softmax(x, dim=1)
 
-# Check if CUDA (GPU) is available and set the device accordingly
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(f'Using device: {device}')
-
-# Image transformations
+# ================================
+# Data preprocessing and loading
+# ================================
+# Data transforms
 transform = transforms.Compose([
-    transforms.Resize((64, 64)),  # Resize the image
-    transforms.ToTensor(),        # Convert the image to Tensor
+    transforms.Resize((48, 48)),
+    transforms.ToTensor(),
 ])
 
-# Load data from the 5 folders
-train_data = datasets.ImageFolder(root='datasets', transform=transform)
-train_loader = DataLoader(train_data, batch_size=32, shuffle=True)
+# Parameters
+batch_size = 32
 
-# Create validation dataset
-val_size = int(0.2 * len(train_data))  # 20% for validation
+# Dataset and DataLoader
+train_dataset = EmotionDataset('datasets/train', transform=transform)
+train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
 
-train_size = len(train_data) - val_size
-train_data, val_data = torch.utils.data.random_split(train_data, [train_size, val_size])
-val_loader = DataLoader(val_data, batch_size=32, shuffle=False)
+val_dataset = EmotionDataset('datasets/val', transform=transform)
+val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
 
-# Model parameters
-input_size = 3 * 64 * 64  # Input size for the fully connected layer (not used in CNN)
-output_size = len(train_data.dataset.classes)  # Number of classes
-
-# Instantiate the model and move it to GPU if available
-model = SimpleCNN(output_size).to(device)
-
-# Loss function and optimizer
+# ================================
+# Model training setup
+# ================================
+# Initialize model, loss function, optimizer
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+model = EmotionClassifier().to(device)
 criterion = nn.CrossEntropyLoss()
-optimizer = optim.Adam(model.parameters(), lr=0.0001)
+optimizer = optim.Adam(model.parameters(), lr=0.001)
 
-# Training the model
-epochs = 10
-for epoch in range(epochs):
-    model.train()  # Set the model to training mode
+# ================================
+# Model training
+# ================================
+best_val_accuracy = 0.0
+early_stopping_counter = 0
+patience = 5
+
+for epoch in range(50):
+    model.train()
     running_loss = 0.0
+    correct_train = 0
+    total_train = 0
+
     for images, labels in train_loader:
-        # Move images and labels to GPU if available
         images, labels = images.to(device), labels.to(device)
-        
+
         optimizer.zero_grad()
         outputs = model(images)
         loss = criterion(outputs, labels)
         loss.backward()
         optimizer.step()
-        
+
         running_loss += loss.item() * images.size(0)
-    
-    epoch_loss = running_loss / len(train_loader.dataset)
-    
+        _, predicted = torch.max(outputs, 1)
+        correct_train += (predicted == labels).sum().item()
+        total_train += labels.size(0)
+
+    train_accuracy = correct_train / total_train
+
     # Validation
-    model.eval()  # Set the model to evaluation mode
-    val_labels = []
-    val_predictions = []
+    model.eval()
+    correct_val = 0
+    total_val = 0
+
     with torch.no_grad():
         for images, labels in val_loader:
             images, labels = images.to(device), labels.to(device)
             outputs = model(images)
             _, predicted = torch.max(outputs, 1)
-            val_labels.extend(labels.cpu().numpy())
-            val_predictions.extend(predicted.cpu().numpy())
-    
-    val_accuracy = accuracy_score(val_labels, val_predictions)
-    
-    print(f'Epoch [{epoch+1}/{epochs}], Loss: {epoch_loss:.4f}, Validation Accuracy: {val_accuracy:.4f}')
+            correct_val += (predicted == labels).sum().item()
+            total_val += labels.size(0)
 
-# Save the model and optimizer state
-torch.save({
-    'model_state_dict': model.state_dict(),
-    'optimizer_state_dict': optimizer.state_dict(),
-    'class_names': train_data.dataset.classes  # Save class names for later use
-}, 'model_checkpoint.pth')
+    val_accuracy = correct_val / total_val
 
-print("Model training and evaluation completed. Model saved.")
+    print(f'Epoch [{epoch + 1}/50], Training Accuracy: {train_accuracy:.4f}, Validation Accuracy: {val_accuracy:.4f}')
+
+    # Early Stopping
+    if val_accuracy > best_val_accuracy:
+        best_val_accuracy = val_accuracy
+        early_stopping_counter = 0
+        torch.save(model.state_dict(), 'best_model.pth')
+    else:
+        early_stopping_counter += 1
+        if early_stopping_counter >= patience:
+            print("Early stopping triggered!")
+            break
+
+# ================================
+# Model testing
+# ================================
+# การทดสอบโมเดล
+model.load_state_dict(torch.load('best_model.pth'))
+model.eval()
+
+def test_image(image_path):
+    # เปิดภาพและแปลงเป็น grayscale
+    image = Image.open(image_path).convert('L')  # แปลงเป็นสีเทา
+    # ปรับขนาดภาพให้เป็น 48x48
+    image = image.resize((48, 48))  # ปรับขนาดภาพที่เปิดเป็น 48x48
+    # แปลงเป็น tensor
+    image = transform(image).unsqueeze(0).to(device)  # เพิ่ม dimension สำหรับ batch size
+
+    with torch.no_grad():
+        outputs = model(image)  # ส่งภาพเข้าโมเดล
+        probabilities = F.softmax(outputs, dim=1)  # คำนวณ softmax เพื่อให้เป็นค่าความน่าจะเป็น
+
+    # แสดงผลลัพธ์
+    emotion_labels = ["angry", "happy", "sad", "surprised", "neutral"]
+    print("ผลลัพธ์การจำแนกอารมณ์:")
+    for label, prob in zip(emotion_labels, probabilities[0]):
+        print(f"{label}: {prob:.2f}")
+
+# ทดสอบภาพที่ต้องการ
+test_image('datasets/test/im8.png')
